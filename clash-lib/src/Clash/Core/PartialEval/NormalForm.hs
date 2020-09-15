@@ -19,6 +19,7 @@ module Clash.Core.PartialEval.NormalForm
   , Args
   , Neutral(..)
   , Value(..)
+  , collectValueApps
   , mkValueTicks
   , stripValue
   , collectValueTicks
@@ -36,20 +37,17 @@ import Data.Map.Strict (Map)
 
 import Clash.Core.DataCon (DataCon)
 import Clash.Core.Literal
-import Clash.Core.Term (Term(..), PrimInfo(primName), TickInfo, Pat)
+import Clash.Core.Term (Term(..), PrimInfo(..), TickInfo, Pat)
 import Clash.Core.TyCon (TyConMap)
 import Clash.Core.Type (Type, TyVar)
 import Clash.Core.Var (Id)
 import Clash.Core.VarEnv (VarEnv, InScopeSet)
 import Clash.Driver.Types (Binding(..))
 
-type Args a
-  = [Arg a]
-
 -- | An argument applied to a function / data constructor / primitive.
 --
-type Arg a
-  = Either a Type
+type Arg a = Either a Type
+type Args a = [Arg a]
 
 -- | Neutral terms cannot be reduced, as they represent things like variables
 -- which are unknown, partially applied functions, or case expressions where
@@ -98,6 +96,16 @@ data Value
   | VTick     !Value !TickInfo
   | VThunk    !Term !LocalEnv
   deriving (Show)
+
+collectValueApps :: Value -> Maybe (Neutral Value, Args Value)
+collectValueApps (VNeutral n) = Just (go [] n)
+ where
+  go !args = \case
+    NeApp x y -> go (Left y : args) x
+    NeTyApp x ty -> go (Right ty : args) x
+    neu -> (neu, args)
+
+collectValueApps _ = Nothing
 
 mkValueTicks :: Value -> [TickInfo] -> Value
 mkValueTicks = foldl VTick

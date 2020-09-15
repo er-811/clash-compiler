@@ -28,7 +28,7 @@ package clash-testsuite
 
 package clash-ghc
   ghc-options: -Werror
-  flags: -experimental-evalautor
+  flags: -experimental-evaluator
 
 package clash-benchmark
   ghc-options: -Werror

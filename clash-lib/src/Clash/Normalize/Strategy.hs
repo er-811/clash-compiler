@@ -31,15 +31,26 @@ import Clash.Rewrite.Util
 -- | Normalisation transformation
 normalization :: NormRewrite
 normalization =
-  rmDeadcode >-> constantPropagation >-> rmUnusedExpr >-!-> anf >-!-> rmDeadcode >->
-  bindConst >-> letTL
+  pe >-!->
+  rmDeadcode >->
+  constantPropagation >->
+  rmUnusedExpr >-!->
+  anf >-!->
+  rmDeadcode >->
+  bindConst >->
+  letTL >->
 #if !EXPERIMENTAL_EVALUATOR
-  >-> evalConst
+  evalConst >-!->
 #endif
-  >-!-> cse >-!-> cleanup >->
-  xOptim >-> rmDeadcode >->
-  cleanup >-> recLetRec >-> splitArgs
+  cse >-!->
+  cleanup >->
+  xOptim >->
+  rmDeadcode >->
+  cleanup >->
+  recLetRec >->
+  splitArgs
   where
+    pe         = apply "partialEval" partialEval
     anf        = topdownR (apply "nonRepANF" nonRepANF) >-> apply "ANF" makeANF >-> topdownR (apply "caseCon" caseCon)
     letTL      = topdownSucR (apply "topLet" topLet)
     recLetRec  = apply "recToLetRec" recToLetRec
@@ -53,11 +64,11 @@ normalization =
     cse        = topdownR (apply "CSE" simpleCSE)
     xOptim     = bottomupR (apply "xOptimize" xOptimize)
     cleanup    = topdownR (apply "etaExpandSyn" etaExpandSyn) >->
-                 topdownSucR (apply "inlineCleanup" inlineCleanup) !->
+                 -- topdownSucR (apply "inlineCleanup" inlineCleanup) !->
                  innerMost (applyMany [("caseCon"        , caseCon)
                                       ,("bindConstantVar", bindConstantVar)
                                       ,("letFlat"        , flattenLet)])
-                 >-> rmDeadcode >-> letTL
+                 >-> rmUnusedExpr >-> rmDeadcode >-> letTL
     splitArgs  = topdownR (apply "separateArguments" separateArguments) !->
                  topdownR (apply "caseCon" caseCon)
 
@@ -86,9 +97,7 @@ constantPropagation =
       [ ("applicationPropagation", appPropFast          )
       , ("bindConstantVar"       , bindConstantVar      )
       , ("caseLet"               , caseLet              )
-#if !EXPERIMENTAL_EVALUATOR
       , ("caseCase"              , caseCase             )
-#endif
       , ("caseCon"               , caseCon              )
       , ("elemExistentials"      , elemExistentials     )
       , ("caseElemNonReachable"  , caseElemNonReachable )

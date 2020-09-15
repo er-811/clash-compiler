@@ -17,6 +17,8 @@ module Clash.Core.PartialEval.Monad
   ( -- * Partial Evaluation Monad
     Eval
   , runEval
+    -- * Partial Evaluation Exception
+  , EvalException(..)
     -- * Local and Global Environments
   , getLocalEnv
   , setLocalEnv
@@ -27,10 +29,10 @@ module Clash.Core.PartialEval.Monad
   , getContext
   , withContext
     -- * Local Type Bindings
-  , getTvSubst
   , findTyVar
   , withTyVar
   , withTyVars
+  , normTy
     -- * Local Term Bindings
   , findId
   , withId
@@ -52,6 +54,7 @@ module Clash.Core.PartialEval.Monad
     -- * Accessing Global State
   , getTyConMap
   , getInScope
+  , getAddr
     -- * Fresh Variable Generation
   , getUniqueId
   , getUniqueTyVar
@@ -61,7 +64,7 @@ module Clash.Core.PartialEval.Monad
 
 import           Control.Applicative (Alternative)
 import           Control.Concurrent.Supply (Supply)
-import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
+import           Control.Monad.Catch
 import           Control.Monad.IO.Class (MonadIO)
 
 #if !MIN_VERSION_base(4,13,0)
@@ -70,6 +73,7 @@ import           Control.Monad.Fail (MonadFail)
 
 import           Control.Monad.RWS.Strict (RWST, MonadReader, MonadState)
 import qualified Control.Monad.RWS.Strict as RWS
+import           Data.Bitraversable (bitraverse)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 
@@ -77,9 +81,10 @@ import           Clash.Core.FreeVars (localFVsOfTerms, tyFVsOfTypes)
 import           Clash.Core.Name (OccName)
 import           Clash.Core.PartialEval.AsTerm
 import           Clash.Core.PartialEval.NormalForm
-import           Clash.Core.Subst (Subst, mkTvSubst)
+import           Clash.Core.Subst
+import           Clash.Core.Term (Pat)
 import           Clash.Core.TyCon (TyConMap)
-import           Clash.Core.Type (Kind, KindOrType, Type)
+import           Clash.Core.Type (Kind, KindOrType, Type, normalizeType)
 import           Clash.Core.Util (mkUniqSystemId, mkUniqSystemTyVar)
 import           Clash.Core.Var (Id, TyVar, Var)
 import           Clash.Core.VarEnv
@@ -137,6 +142,30 @@ runEval g l x =
    in extract <$> RWS.runRWST (unEval x) l g
 {-# INLINE runEval #-}
 
+-- | Exceptions specific to partial evaluation. Note that other exceptions
+-- may still be thrown, such as ArithException or IOException.
+--
+data EvalException
+  = ResultUndefined
+    -- ^ The result of an evaluation is undefined. This can be used as an early
+    -- exit for some primitives, or when evaluating case expressions.
+  | CannotApply Value (Arg Value)
+    -- ^ An attempt to apply an argument to an incompatible value was made,
+    -- for instance applying to a non-function value.
+  | CannotMatch Value [Pat]
+    -- ^ An attempt to match the given value on the following patterns did
+    -- not succeed. This likely means the supplied patterns were non-exhaustive.
+  | CannotConvert Value Type
+    -- ^ An attempt to convert a value to an element of the specified type did
+    -- not succeed. This likely means a primitive failed to evaluate from not
+    -- all relevant arguments being statically known.
+  | NoHeapBinding Int
+    -- ^ An attempt to read from the IO heap failed as there was no binding.
+    -- This is indicative of an internal error in the evaluator.
+  deriving (Show)
+
+instance Exception EvalException
+
 getLocalEnv :: Eval LocalEnv
 getLocalEnv = RWS.ask
 {-# INLINE getLocalEnv #-}
@@ -169,48 +198,79 @@ findTyVar :: TyVar -> Eval (Maybe Type)
 findTyVar i = Map.lookup i . lenvTypes <$> getLocalEnv
 
 withTyVar :: TyVar -> Type -> Eval a -> Eval a
-withTyVar i a x = do
-  modifyGlobalEnv goGlobal
-  modifyLocalEnv goLocal x
- where
-  goGlobal env@GlobalEnv{genvInScope=inScope} =
-    let fvs = unitVarSet i `unionVarSet` tyFVsOfTypes [a]
-        iss = mkInScopeSet fvs `unionInScope` inScope
-     in env { genvInScope = iss }
-
-  goLocal env@LocalEnv{lenvTypes=types} =
-    env { lenvTypes = Map.insert i a types }
+withTyVar i ty = withTyVars [(i, ty)]
 
 withTyVars :: [(TyVar, Type)] -> Eval a -> Eval a
-withTyVars = flip $ foldr (uncurry withTyVar)
+withTyVars tys action = do
+  normTys <- traverse (bitraverse pure normTy) tys
 
-getTvSubst :: Eval Subst
-getTvSubst = do
-  inScope <- getInScope
-  tys <- lenvTypes <$> getLocalEnv
-  let vars = mkVarEnv (Map.toList tys)
+  modifyGlobalEnv (goGlobal normTys)
+  modifyLocalEnv (goLocal normTys) action
+ where
+  goGlobal xs env@GlobalEnv{genvInScope=inScope} =
+    let vs = mkVarSet (fst <$> xs) `unionVarSet` tyFVsOfTypes (snd <$> xs)
+        is = inScope `unionInScope` mkInScopeSet vs
+     in env { genvInScope = is }
 
-  pure (mkTvSubst inScope vars)
+  goLocal xs env@LocalEnv{lenvTypes=types} =
+    (substEnvTys xs env) { lenvTypes = Map.fromList xs <> types }
+
+-- | Substitute all bound types in the environment with the list of bindings.
+-- This must be used after normTy to ensure that the substitution does not
+-- introduce new free variables into a type.
+--
+substEnvTys :: [(TyVar, Type)] -> LocalEnv -> LocalEnv
+substEnvTys tys env =
+  env { lenvTypes = fmap go (lenvTypes env) }
+ where
+  substFvs = tyFVsOfTypes (snd <$> tys)
+  substVars = mkVarSet (fst <$> tys)
+
+  go ty =
+    let domFvs = tyFVsOfTypes [ty]
+        inScope = differenceVarSet (substFvs `unionVarSet` domFvs) substVars
+        subst = mkTvSubst (mkInScopeSet inScope) (mkVarEnv tys)
+     in substTy subst ty
+
+-- | Normalize a binding of type to tyvar using the existing environment. This
+-- is needed to ensure that new bindings in the environment do not contain
+-- variable references to bindings already in the environment, as these tyvars
+-- may become free when substituted into the result.
+--
+normTy :: Type -> Eval Type
+normTy ty = do
+  tcm <- getTyConMap
+  tys <- Map.toList . lenvTypes <$> getLocalEnv
+
+  let substFvs = tyFVsOfTypes (snd <$> tys)
+      substVars = mkVarSet (fst <$> tys)
+      domFvs = tyFVsOfTypes [ty]
+      inScope = differenceVarSet (substFvs `unionVarSet` domFvs) substVars
+      subst = mkTvSubst (mkInScopeSet inScope) (mkVarEnv tys)
+
+  pure (normalizeType tcm (substTy subst ty))
 
 findId :: Id -> Eval (Maybe Value)
 findId i = Map.lookup i . lenvValues <$> getLocalEnv
 
 withId :: Id -> Value -> Eval a -> Eval a
-withId i v x = do
+withId i v = withIds [(i, v)]
+
+withIds :: [(Id, Value)] -> Eval a -> Eval a
+withIds ids action = do
   modifyGlobalEnv goGlobal
-  modifyLocalEnv goLocal x
+  modifyLocalEnv goLocal action
  where
   goGlobal env@GlobalEnv{genvInScope=inScope} =
     --  TODO Is it a hack to use asTerm here?
-    let fvs = unitVarSet i `unionVarSet` localFVsOfTerms [asTerm v]
-        iss = mkInScopeSet fvs `unionInScope` inScope
+    --  Arguably yes, but you can't take FVs of Value / Neutral yet.
+    let fvs = mkVarSet (fst <$> ids)
+                `unionVarSet` localFVsOfTerms (asTerm . snd <$> ids)
+        iss = inScope `unionInScope` mkInScopeSet fvs
      in env { genvInScope = iss }
 
   goLocal env@LocalEnv{lenvValues=values} =
-    env { lenvValues = Map.insert i v values }
-
-withIds :: [(Id, Value)] -> Eval a -> Eval a
-withIds = flip $ foldr (uncurry withId)
+    env { lenvValues = Map.fromList ids <> values }
 
 withoutId :: Id -> Eval a -> Eval a
 withoutId i = modifyLocalEnv go
@@ -233,7 +293,7 @@ getRef addr = do
 
   case IntMap.lookup addr heap of
     Just val -> pure val
-    Nothing  -> error ("getHeap: Address " <> show addr <> " out of bounds")
+    Nothing  -> throwM (NoHeapBinding addr)
 
 setRef :: Int -> Value -> Eval ()
 setRef addr val = modifyGlobalEnv go
@@ -282,6 +342,9 @@ getTyConMap = genvTyConMap <$> getGlobalEnv
 getInScope :: Eval InScopeSet
 getInScope = genvInScope <$> getGlobalEnv
 
+getAddr :: Eval Int
+getAddr = genvAddr <$> getGlobalEnv
+
 getUniqueId :: OccName -> Type -> Eval Id
 getUniqueId = getUniqueVar mkUniqSystemId
 
@@ -309,6 +372,7 @@ getUniqueVar f name ty = do
 
 workFreeValue :: Value -> Eval Bool
 workFreeValue = \case
+  VNeutral (NeVar _) -> pure True
   VNeutral _ -> pure False
   VThunk x _ -> do
     bindings <- fmap (fmap asTerm) . genvBindings <$> getGlobalEnv

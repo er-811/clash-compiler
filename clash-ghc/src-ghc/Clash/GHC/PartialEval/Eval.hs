@@ -18,11 +18,14 @@ module Clash.GHC.PartialEval.Eval
   , applyTy
   ) where
 
+import           Control.Exception (ArithException, IOException)
 import           Control.Monad (foldM)
+import           Control.Monad.Catch hiding (mask)
 import           Data.Bifunctor
 import           Data.Bitraversable
 import           Data.Either
 import           Data.Graph (SCC(..))
+import qualified Data.HashMap.Strict as HashMap
 import           Data.Primitive.ByteArray (ByteArray(..))
 import           GHC.Integer.GMP.Internals (BigNat(..), Integer(..))
 
@@ -31,9 +34,9 @@ import           BasicTypes (InlineSpec(..))
 import           Clash.Core.DataCon (DataCon(..))
 import           Clash.Core.Literal (Literal(..))
 import           Clash.Core.PartialEval.AsTerm
+import           Clash.Core.Name (nameOcc)
 import           Clash.Core.PartialEval.Monad
 import           Clash.Core.PartialEval.NormalForm
-import           Clash.Core.Subst (substTy)
 import           Clash.Core.Term
 import           Clash.Core.TermInfo
 import           Clash.Core.TyCon (tyConDataCons)
@@ -43,6 +46,29 @@ import qualified Clash.Core.Util as Util
 import           Clash.Core.Var
 import           Clash.Driver.Types (Binding(..), IsPrim(..))
 import           Clash.Unique (lookupUniqMap')
+
+import           Clash.GHC.PartialEval.Primitive.Bit
+import           Clash.GHC.PartialEval.Primitive.BitVector
+import           Clash.GHC.PartialEval.Primitive.ByteArray
+import           Clash.GHC.PartialEval.Primitive.Char
+import           Clash.GHC.PartialEval.Primitive.Double
+import           Clash.GHC.PartialEval.Primitive.Enum
+import           Clash.GHC.PartialEval.Primitive.Float
+import           Clash.GHC.PartialEval.Primitive.GhcMisc
+import           Clash.GHC.PartialEval.Primitive.Index
+import           Clash.GHC.PartialEval.Primitive.Info
+import           Clash.GHC.PartialEval.Primitive.Int
+import           Clash.GHC.PartialEval.Primitive.Integer
+import           Clash.GHC.PartialEval.Primitive.Narrowing
+import           Clash.GHC.PartialEval.Primitive.Natural
+import           Clash.GHC.PartialEval.Primitive.Promoted
+import           Clash.GHC.PartialEval.Primitive.Signed
+import           Clash.GHC.PartialEval.Primitive.Transformations
+import           Clash.GHC.PartialEval.Primitive.Unsigned
+import           Clash.GHC.PartialEval.Primitive.Vector
+import           Clash.GHC.PartialEval.Primitive.Word
+
+-- import Clash.Debug -- TODO
 
 -- | Evaluate a term to WHNF.
 --
@@ -75,23 +101,16 @@ forceEval = forceEvalWith [] []
 forceEvalWith :: [(TyVar, Type)] -> [(Id, Value)] -> Value -> Eval Value
 forceEvalWith tvs ids = \case
   VThunk term env -> do
-    tvs' <- traverse (traverse evalType) tvs
+    tvs' <- traverse (bitraverse pure normTy) tvs
     setLocalEnv env (withTyVars tvs' . withIds ids $ eval term)
 
   value -> pure value
 
 delayArg :: Arg Term -> Eval (Arg Value)
-delayArg = bitraverse delayEval evalType
+delayArg = bitraverse delayEval normTy
 
 delayArgs :: Args Term -> Eval (Args Value)
 delayArgs = traverse delayArg
-
-evalType :: Type -> Eval Type
-evalType ty = do
-  tcm <- getTyConMap
-  subst <- getTvSubst
-
-  pure (normalizeType tcm (substTy subst ty))
 
 evalVar :: Id -> Eval Value
 evalVar i
@@ -101,8 +120,8 @@ evalVar i
 lookupLocal :: Id -> Eval Value
 lookupLocal i = do
   var <- findId i
-  varTy <- evalType (varType i)
-  let i' = i { varType = varTy }
+  iTy <- normTy (varType i)
+  let i' = i { varType = iTy }
 
   case var of
     Just x  -> do
@@ -150,14 +169,129 @@ evalData dc
 evalPrim :: PrimInfo -> Eval Value
 evalPrim pr
   | fullyApplied (primType pr) [] =
-      evalPrimOp pr []
+      evalPrimitive pr []
 
   | otherwise =
       etaExpand (Prim pr) >>= eval
 
--- TODO Hook up to primitive evaluation skeleton
-evalPrimOp :: PrimInfo -> Args Value -> Eval Value
-evalPrimOp pr args = pure (VNeutral (NePrim pr args))
+-- | Evaluate a primitive with the given arguments.
+-- See NOTE [Evaluating primitives] for more information.
+--
+evalPrimitive
+  :: PrimInfo
+  -- ^ The primitive to evaluate
+  -> Args Value
+  -- ^ The arguments supplied to the primitive
+  -> Eval Value
+  -- ^ The result of evaluating the primitive
+evalPrimitive pr args = do
+  ty <- resultType pr args
+
+  case HashMap.lookup (primName pr) primitives of
+    Just f ->
+      f eval pr args `catches`
+        [ -- Catch an Eval specific error and attempt to correct it.
+          -- TODO This should print warnings if Clash is built with +debug
+          Handler $ \(e :: EvalException) ->
+            case e of
+              ResultUndefined -> eval (Util.undefinedTm ty)
+              _ -> pure (VNeutral (NePrim pr args))
+
+          -- Change to the value 'undefined', the evaluator was asked to
+          -- evaluate something invalid (e.g. division by zero or overflow).
+        , Handler $ \(_ :: ArithException) -> eval (Util.undefinedTm ty)
+
+          -- The Alternative / MonadPlus instance for IO throws an IOException
+          -- on empty / mzero. Catch this and return a neutral primitive.
+        , Handler $ \(_ :: IOException)  -> pure (VNeutral (NePrim pr args))
+        ]
+
+    Nothing -> do
+      fuel <- getFuel
+
+      -- If there is no evaluation rule for a primitive, it can still be
+      -- possible to evaluate using a known core unfolding. Any recursive calls
+      -- in the result must be converted back to NePrim - this affects netlist.
+      --
+      case primCoreId pr of
+        Just c | fuel /= 0 ->
+          withFuel $ do
+            core <- eval (Var c)
+            result <- foldM applyArg core args
+            pure (replaceRecursion pr result)
+
+        _ -> pure (VNeutral (NePrim pr args))
+ where
+  primitives = HashMap.unions
+    [ bitPrims
+    , bitVectorPrims
+    , byteArrayPrims
+    , charPrims
+    , doublePrims
+    , enumPrims
+    , floatPrims
+    , ghcPrims
+    , indexPrims
+    , intPrims
+    , integerPrims
+    , narrowingPrims
+    , naturalPrims
+    , promotedPrims
+    , signedPrims
+    , transformationsPrims
+    , unsignedPrims
+    , vectorPrims
+    , wordPrims
+    ]
+
+-- | If the evaluator runs out of fuel, it may be left with a recursive call to
+-- the primitive being evaluated. To avoid this, traverse the resulting value
+-- and replace any recursive calls with a NePrim.
+--
+-- This assumes that the core unfolding for a primitive does not call
+-- any other primtiives that rely on a core unfolding. If this turns out
+-- to not be true, replaceRecursion would need to consider whether any
+-- application represents a primitive call that is unfolded.
+--
+replaceRecursion :: PrimInfo -> Value -> Value
+replaceRecursion pr = go
+ where
+  go = \case
+    VCast v a b  -> VCast (go v) a b
+    VTick v tick -> VTick (go v) tick
+    value        ->
+      case collectValueApps value of
+        Just (NeVar i, args)  ->
+          if nameOcc (varName i) == primName pr
+            then VNeutral (NePrim pr args)
+            else value
+
+        _                     -> value
+
+{-
+NOTE [Evaluating primitives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When the evalutor encounters a primtive operation with all arguments applied,
+it will attempt to evaluate it. If this is possible, the call to the primitive
+will be replaced with the result. However, it may not be possible to evaluate
+a primitive if not all arguments are statically known (i.e. if an argument is
+a variable with an unknown value). In this case, a neutral primitive is
+returned instead.
+
+Some primitives do not evaluate, and are deliberately preserved in the result
+of the evaluator as netural primitives. Notable examples of this are
+
+  * GHC.CString.unpackCString#
+  * Clash.Sized.Internal.BitVector.fromInteger##
+  * Clash.Sized.Internal.BitVector.fromInteger#
+  * Clash.Sized.Internal.Index.fromInteger#
+  * Clash.Sized.Internal.Signed.fromInteger#
+  * Clash.Sized.Internal.Unsigned.fromInteger#
+
+Some primitives may throw exceptions (such as division by zero) or need to
+perform IO (e.g. primitives on ByteArray#). These effects are supported by the
+Eval monad, see Clash.Core.PartialEval.Monad.
+-}
 
 fullyApplied :: Type -> Args a -> Bool
 fullyApplied ty args =
@@ -185,17 +319,17 @@ etaExpand term = do
 
 evalLam :: Id -> Term -> Eval Value
 evalLam i x = do
-  varTy <- evalType (varType i)
-  let i' = i { varType = varTy }
   env <- getLocalEnv
+  iTy <- normTy (varType i)
+  let i' = i { varType = iTy }
 
   pure (VLam i' x env)
 
 evalTyLam :: TyVar -> Term -> Eval Value
 evalTyLam i x = do
-  varTy <- evalType (varType i)
-  let i' = i { varType = varTy }
   env <- getLocalEnv
+  iTy <- normTy (varType i)
+  let i' = i { varType = iTy }
 
   pure (VTyLam i' x env)
 
@@ -221,12 +355,12 @@ evalApp x y
         let tyVars = lefts prArgs
             tyArgs = rights args
 
-        withTyVars (zip tyVars tyArgs) (evalPrimOp pr argThunks)
+        withTyVars (zip tyVars tyArgs) (evalPrimitive pr argThunks)
 
       GT -> do
         let (pArgs, rArgs) = splitAt numArgs args
         pArgThunks <- delayArgs pArgs
-        primRes <- evalPrimOp pr pArgThunks
+        primRes <- evalPrimitive pr pArgThunks
         rArgThunks <- delayArgs rArgs
 
         foldM applyArg primRes rArgThunks
@@ -252,10 +386,11 @@ evalLetrec bs x = do
     _  -> pure (VNeutral (NeLetrec keep eX))
  where
   evalBind (i, y) = do
-    iTy <- evalType (varType i)
+    iTy <- normTy (varType i)
+    let i' = i { varType = iTy }
     eY <- delayEval y
 
-    pure (i { varType = iTy }, eY)
+    pure (i', eY)
 
   evalScc (k, i) = \case
     AcyclicSCC y -> do
@@ -283,6 +418,7 @@ evalCase term ty as = do
 caseCon :: Value -> Type -> [(Pat, Value)] -> Eval Value
 caseCon subject ty alts = do
   forcedSubject <- keepLifted (forceEval subject)
+  let pats = fmap fst alts
 
   -- If the subject is undefined, the whole expression is undefined.
   case isUndefined forcedSubject of
@@ -365,8 +501,8 @@ delayAlts = traverse (bitraverse delayPat delayEval)
  where
   delayPat = \case
     DataPat dc tvs ids -> do
-      tvsTys <- traverse evalType (fmap varType tvs)
-      idsTys <- traverse evalType (fmap varType ids)
+      tvsTys <- traverse normTy (varType <$> tvs) -- TODO Remove?
+      idsTys <- traverse normTy (varType <$> ids)
 
       let setTy v ty = v { varType = ty }
           tvs' = zipWith setTy tvs tvsTys
@@ -383,12 +519,12 @@ data PatResult
   = Match   (Pat, Value) [(TyVar, Type)] [(Id, Value)]
   | NoMatch
 
-evalAlt :: Value -> PatResult -> Eval Value
+evalAlt :: Eval Value -> PatResult -> Eval Value
 evalAlt def = \case
   Match (_, val) tvs ids ->
     forceEvalWith tvs ids val
 
-  NoMatch -> pure def
+  NoMatch -> def
 
 matchLiteral :: Literal -> (Pat, Value) -> Eval PatResult
 matchLiteral lit alt@(pat, _) =
@@ -477,7 +613,7 @@ matchClashPrim pr args alt@(pat, _) =
               then pure (Match alt [] [])
               else pure NoMatch
 
-      -- Sized integer / natural literals
+      -- Index / Sized / Unsigned literals
       |  primName pr `elem` clashSizedNumbers
       ,  [Right _n, Left _knN, Left val] <- args
       -> do VLiteral l <- forceEval val
@@ -518,14 +654,13 @@ findBestAlt checkAlt =
       NoMatch -> go acc as
 
 evalCast :: Term -> Type -> Type -> Eval Value
-evalCast x a b = VCast <$> eval x <*> evalType a <*> evalType b
+evalCast x a b = VCast <$> eval x <*> normTy a <*> normTy b
 
 evalTick :: TickInfo -> Term -> Eval Value
 evalTick tick x = VTick <$> eval x <*> pure tick
 
 applyArg :: Value -> Arg Value -> Eval Value
-applyArg val =
-  either (apply val) (applyTy val)
+applyArg val = either (apply val) (applyTy val)
 
 apply :: Value -> Value -> Eval Value
 apply val arg = do
@@ -542,17 +677,17 @@ apply val arg = do
           pure (VNeutral (NeLetrec bs inner))
 
       | otherwise -> do
-          varTy <- evalType (valueType tcm arg)
+          varTy <- normTy (valueType tcm arg)
           var <- getUniqueId "workArg" varTy
           inner <- apply x (VNeutral (NeVar var))
-          pure (VNeutral (NeLetrec ((var, arg) : bs) inner))
+          pure (VNeutral (NeLetrec (bs <> [(var, arg)]) inner))
 
     -- If the LHS of application is neutral, make a letrec around the neutral
     -- application if the argument performs work.
     VNeutral neu
       | canApply  -> pure (VNeutral (NeApp neu arg))
       | otherwise -> do
-          varTy <- evalType (valueType tcm arg)
+          varTy <- normTy (valueType tcm arg)
           var <- getUniqueId "workArg" varTy
           let inner = VNeutral (NeApp neu (VNeutral (NeVar var)))
           pure (VNeutral (NeLetrec [(var, arg)] inner))
@@ -565,8 +700,7 @@ apply val arg = do
           inner <- withId i arg (eval x)
           pure (VNeutral (NeLetrec [(i, arg)] inner))
 
-    f ->
-      error ("apply: Cannot apply " <> show arg <> " to " <> show f)
+    f -> throwM (CannotApply f (Left arg))
  where
   -- Somewhat of a cheat, but very quick to implement.
   valueType tcm = termType tcm . asTerm
@@ -574,7 +708,7 @@ apply val arg = do
 applyTy :: Value -> Type -> Eval Value
 applyTy val ty = do
   forcedVal <- forceEval val
-  argTy <- evalType ty
+  argTy <- normTy ty
 
   case stripValue forcedVal of
     VNeutral n ->
@@ -583,5 +717,4 @@ applyTy val ty = do
     VTyLam i x env ->
       setLocalEnv env $ withTyVar i argTy (eval x)
 
-    f ->
-      error ("applyTy: Cannot apply " <> show argTy <> " to " <> show f)
+    f -> throwM (CannotApply f (Right argTy))

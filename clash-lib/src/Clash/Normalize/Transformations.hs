@@ -59,6 +59,9 @@ module Clash.Normalize.Transformations
   , separateArguments
   , separateLambda
   , xOptimize
+
+  -- experimental
+  , partialEval
   )
 where
 
@@ -138,6 +141,9 @@ import           Clash.Rewrite.Util
 import           Clash.Unique
 import           Clash.Util
 import qualified Clash.Util.Interpolate as I
+
+partialEval :: NormRewrite
+partialEval ctx e = whnfRW False ctx e (\_ e' -> changed e')
 
 inlineOrLiftNonRep :: HasCallStack => NormRewrite
 inlineOrLiftNonRep ctx eLet@(Letrec _ body) =

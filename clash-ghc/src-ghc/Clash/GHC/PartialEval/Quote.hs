@@ -59,17 +59,13 @@ quoteData dc args env = setLocalEnv env (NData dc <$> quoteArgs args)
 quoteLam :: Id -> Term -> LocalEnv -> Eval Normal
 quoteLam i x env =
   setLocalEnv env $ do
-    eX <- apply (VLam i x env) (VNeutral (NeVar i))
-    qX <- quote eX
-
+    qX <- eval x >>= quote
     pure (NLam i qX env)
 
 quoteTyLam :: TyVar -> Term -> LocalEnv -> Eval Normal
 quoteTyLam i x env =
   setLocalEnv env $ do
-    eX <- applyTy (VTyLam i x env) (VarTy i)
-    qX <- quote eX
-
+    qX <- eval x >>= quote
     pure (NTyLam i qX env)
 
 quoteCast :: Value -> Type -> Type -> Eval Normal

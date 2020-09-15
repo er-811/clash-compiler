@@ -22,5 +22,5 @@ fi
 
 # Run HDL generation / simulation
 if [[ "$RUN_TESTSUITE" = "yes" ]]; then
-  cabal new-run -- clash-testsuite -j$THREADS --hide-successes -p "/.VHDL./ || /.Verilog./"
+  cabal new-run -- clash-testsuite:clash-testsuite -j$THREADS --hide-successes -p "/.VHDL./ || /.Verilog./"
 fi
