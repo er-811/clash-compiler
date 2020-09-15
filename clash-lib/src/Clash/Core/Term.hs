@@ -118,7 +118,8 @@ data PrimInfo = PrimInfo
   { primName     :: !Text
   , primType     :: !Type
   , primWorkInfo :: !WorkInfo
-  } deriving (Show,Generic,NFData,Hashable,Binary)
+  , primCoreId   :: !(Maybe Id)
+  } deriving (Eq,Show,Generic,NFData,Hashable,Binary)
 
 data WorkInfo
   = WorkConstant
